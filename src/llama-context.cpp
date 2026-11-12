@@ -4629,6 +4629,36 @@ struct ggml_cgraph * llama_graph_reserve(
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
 }
 
+bool llama_diffusion_reserve_graphs(struct llama_context * ctx, int32_t P, int32_t C) {
+    if (!ctx || P <= 0 || C <= 0) {
+        return false;
+    }
+    auto * model = const_cast<llama_model *>(&ctx->get_model());
+    const int32_t chunk = std::min<int32_t>(P, (int32_t) ctx->n_ubatch());
+
+    llama_set_causal_attn(ctx, false);
+    bool ok = false;
+    try {
+        // as a turn runs them: PREFILL without self-conditioning, DECODE with it read from the device
+        llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, false);
+        llama_diffusion_set_phase(model, 1, P, P - chunk);
+        ok = llama_graph_reserve(ctx, chunk, 1, 1) != nullptr;
+        if (ok) {
+            llama_diffusion_set_device_sc(model, true);
+            llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, true);
+            llama_diffusion_set_phase(model, 2, P, 0);
+            ok = llama_graph_reserve(ctx, C, 1, C) != nullptr;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.what());
+        ok = false;
+    }
+    llama_diffusion_set_phase(model, 0, 0, 0);
+    llama_diffusion_set_device_sc(model, false);
+    llama_diffusion_set_sc(model, nullptr, 0.0f, 1.0f, true);
+    return ok;
+}
+
 // llama adapter API
 
 int32_t llama_set_adapters_lora(

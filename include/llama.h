@@ -658,6 +658,14 @@ extern "C" {
             struct llama_model * model,
                        int32_t   C);
 
+    // Reserve the largest graphs a DiffusionGemma turn of P prompt tokens and a canvas of C builds (the last
+    // PREFILL chunk and a DECODE step), so that no compute buffer grows mid-turn. Call after
+    // llama_diffusion_reserve_pkv for the same P. False when they do not fit.
+    LLAMA_API bool llama_diffusion_reserve_graphs(
+            struct llama_context * ctx,
+                         int32_t   P,
+                         int32_t   C);
+
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);

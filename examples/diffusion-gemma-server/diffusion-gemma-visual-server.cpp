@@ -213,15 +213,40 @@ int main(int argc, char ** argv) {
     }
 
     const size_t vram_headroom = v_total ? (size_t) (v_total * 0.08) : (size_t) 1536 * 1024 * 1024;
-    // Allocates the store for a context of N full of prompt. A store that took VRAM must leave the per-step pool.
-    auto reserve_store = [&](int N) {
-        if (!one_gpu) return true;
+    // What a fully reserved turn must still leave free on the GPU for the backend's own per-step allocations.
+    size_t turn_margin = (size_t) 512 * 1024 * 1024;
+    if (const char * e = getenv("DG_TURN_MARGIN_MB")) {   // diagnostics
+        turn_margin = (size_t) atoll(e) * 1024 * 1024;
+    }
+
+    // Reserves what a turn filling a context of N allocates: the prompt-KV store and the largest PREFILL and
+    // DECODE graphs. On failure nothing stays reserved.
+    auto reserve_turn = [&](llama_context * c, int N) {
+        const int32_t P = N - (int32_t) canvas_length;
+        if (!one_gpu || P <= 0) return true;
         size_t f0 = 0, f1 = 0, t = 0;
         if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &f0, &t);
-        if (!llama_diffusion_reserve_pkv(model, N - (int32_t) canvas_length, fa_on)) return false;
-        if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &f1, &t);
-        if (f1 < f0 && f1 < vram_headroom) { llama_diffusion_reserve_pkv(model, 0, fa_on); return false; }
-        return true;
+        bool ok = llama_diffusion_reserve_pkv(model, P, fa_on) &&
+                  llama_diffusion_reserve_graphs(c, P, (int32_t) canvas_length);
+        if (ok && gpu_dev) {
+            ggml_backend_dev_memory(gpu_dev, &f1, &t);
+            ok = !(f1 < f0 && f1 < turn_margin);
+        }
+        if (!ok) llama_diffusion_reserve_pkv(model, 0, fa_on);
+        return ok;
+    };
+
+    // A context of N with a full turn reserved, or null. budget>0 first rules out what cannot fit in that many
+    // bytes: the fp32 [n_head, N, N] scores buffer (unavoidable with FA off) plus the store.
+    auto try_size = [&](int N, size_t budget) -> llama_context * {
+        if (budget) {
+            const double min_scores = (double) n_head * (double) N * (double) N * 4.0;
+            const double store      = (double) pkv_per_tok * (double) std::max<int64_t>(0, N - canvas_length);
+            if (min_scores + store > (double) budget * 0.9) return nullptr;
+        }
+        llama_context * c = llama_init_from_model(model, make_cparams(N));
+        if (c && !reserve_turn(c, N)) { llama_free(c); c = nullptr; }
+        return c;
     };
 
     // Probe descending candidates within `budget` bytes; return the largest that allocates. gpu_headroom>0
@@ -231,17 +256,11 @@ int main(int argc, char ** argv) {
             if (raw > ceil_ctx) continue;
             int N = (int) ((raw / canvas_length) * canvas_length);   // whole canvases only
             if (N < floor_ctx) break;
-            if (budget) {   // an fp32 [n_head, N, N] scores buffer is unavoidable (FA off): skip if it can't fit
-                const double min_scores = (double) n_head * (double) N * (double) N * 4.0;
-                const double store      = (double) pkv_per_tok * (double) (N - canvas_length);
-                if (min_scores + store > (double) budget * 0.9) continue;
-            }
-            llama_context * c = llama_init_from_model(model, make_cparams(N));
+            llama_context * c = try_size(N, budget);
             if (!c) continue;
-            if (!reserve_store(N)) { llama_free(c); continue; }
             if (gpu_headroom && gpu_dev) {
                 size_t f = 0, t = 0; ggml_backend_dev_memory(gpu_dev, &f, &t);
-                if (f < gpu_headroom) { llama_free(c); continue; }
+                if (f < gpu_headroom) { llama_free(c); llama_diffusion_reserve_pkv(model, 0, fa_on); continue; }
             }
             *out_n = N;
             return c;
@@ -252,19 +271,13 @@ int main(int argc, char ** argv) {
     int MAXTOK = 0;
     llama_context * ctx = nullptr;
     const char * reason = "auto";
+    const int ceil_ctx = MAXTOK_ENV > 0 ? std::min(auto_ceil, MAXTOK_ENV) : auto_ceil;
 
     if (MAXTOK_ENV > 0 && (one_gpu || MAXTOK_ENV <= split_ceil)) {   // explicit budget: honour exactly if it fits, else degrade through the probe
-        const double sc = (double) n_head * (double) MAXTOK_ENV * (double) MAXTOK_ENV * 4.0
-                        + (double) pkv_per_tok * (double) std::max<int64_t>(0, MAXTOK_ENV - canvas_length);
-        const size_t budget = std::max(v_free, ram_budget);
-        if (!budget || sc <= (double) budget * 0.9) {
-            ctx = llama_init_from_model(model, make_cparams(MAXTOK_ENV));
-            if (ctx && !reserve_store(MAXTOK_ENV)) { llama_free(ctx); ctx = nullptr; }
-            if (ctx) { MAXTOK = MAXTOK_ENV; reason = "requested"; }
-        }
+        ctx = try_size(MAXTOK_ENV, std::max(v_free, ram_budget));
+        if (ctx) { MAXTOK = MAXTOK_ENV; reason = "requested"; }
     }
     if (!ctx) {
-        const int ceil_ctx = MAXTOK_ENV > 0 ? std::min(auto_ceil, MAXTOK_ENV) : auto_ceil;
         int n1 = 0;
         ctx = probe(ceil_ctx, v_free, vram_headroom, &n1);       // pass 1: VRAM-gated (unchanged on ample VRAM)
         if (ctx) { MAXTOK = n1; reason = "vram"; }
@@ -274,14 +287,31 @@ int main(int argc, char ** argv) {
             if (c && n2 > MAXTOK) { if (ctx) llama_free(ctx); ctx = c; MAXTOK = n2; reason = "ram"; }
             else if (c) { llama_free(c); }
         }
+        // The candidates are coarse, and pass 2 probed with pass 1's context still allocated: search the
+        // canvases above the chosen size with nothing else held.
+        const int C = (int) canvas_length;
+        int lo = MAXTOK, hi = (ceil_ctx / C) * C + C;
+        if (ctx && one_gpu && hi - lo > C) {
+            llama_free(ctx);
+            ctx = nullptr;
+            llama_diffusion_reserve_pkv(model, 0, fa_on);
+            while (hi - lo > C) {
+                const int mid = ((lo + hi) / 2 / C) * C;
+                llama_context * c = try_size(mid, std::max(v_free, ram_budget));
+                if (c) { lo = mid; llama_free(c); llama_diffusion_reserve_pkv(model, 0, fa_on); }
+                else   { hi = mid; }
+            }
+            ctx = try_size(lo, 0);
+            if (ctx) MAXTOK = lo;
+        }
     }
     if (!ctx) {   // last resort: the floor so a very tight machine still loads
         int N = std::max((int) canvas_length, (int) ((floor_ctx / canvas_length) * canvas_length));
         ctx = llama_init_from_model(model, make_cparams(N));
         if (ctx) { MAXTOK = N; reason = "floor"; }
     }
-    // A rejected larger candidate frees the store, so the chosen context gets its own back here.
-    if (ctx && one_gpu && !llama_diffusion_reserve_pkv(model, MAXTOK - (int32_t) canvas_length, fa_on)) {
+    // A rejected candidate frees the store, so the chosen context gets its own turn back here.
+    if (ctx && !reserve_turn(ctx, MAXTOK)) {
         llama_free(ctx);
         ctx = nullptr;
     }
