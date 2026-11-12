@@ -815,7 +815,13 @@ static bool dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     ggml_backend_dev_t dev = m.dev_layer(0);
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
                                           : ggml_backend_cpu_buffer_type();
-    m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
+    // A device that reports less free memory than the store needs is not asked, so a sizing probe stays quiet.
+    size_t dev_free = 0, dev_total = 0;
+    if (dev) {
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    }
+    const bool fits = dev_total == 0 || ggml_backend_alloc_ctx_tensors_from_buft_size(m.pkv_ctx, buft) <= dev_free;
+    m.pkv_buf = fits ? ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft) : nullptr;
     if (m.pkv_buf == nullptr) {
         dg_free_pkv_store(m);
         return false;
