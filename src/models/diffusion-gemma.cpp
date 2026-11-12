@@ -330,7 +330,7 @@ static void dg_ensure_sc_embT(const llama_model_diffusion_gemma & m);
 static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C);
 // fwd decl: lazily (re)allocate the device-resident prompt-KV store (per-layer K,V, grow-only) at the given
 // element type. Allocated from the graph so the type can follow cparams.flash_attn (F16 under FA).
-static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type);
+static bool dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type);
 
 std::unique_ptr<llm_graph_context> llama_model_diffusion_gemma::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
@@ -369,7 +369,8 @@ llama_model_diffusion_gemma::graph::graph(const llama_model & model, const llm_g
     // Allocate the store on the first PREFILL chunk, sized to the whole prompt (pkv_P). Type follows FA so it
     // is precision-neutral: under FA, build_attn casts K,V to F16 regardless. DECODE only reads a prior store.
     if (is_prefill && dmodel.pkv_P > 0) {
-        dg_ensure_pkv_store(dmodel, dmodel.pkv_P, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        const bool pkv_ok = dg_ensure_pkv_store(dmodel, dmodel.pkv_P, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32);
+        GGML_ASSERT(pkv_ok && "DiffusionGemma prompt-KV store does not fit in memory");
     }
 
     // guard the prompt-KV store is allocated and large enough (misuse fails loudly, not OOB)
@@ -775,14 +776,20 @@ static void dg_ensure_sc_dev(const llama_model_diffusion_gemma & m, int64_t C) {
 // P at element type `type`, on layer-0's buffer type (single-GPU; cross-device would need a per-buft context
 // map). Reallocates when the capacity grows or the type changes. Called from the graph (PREFILL), where the
 // type can follow cparams.flash_attn - F16 halves the store and is precision-neutral under FA.
-static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type) {
-    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
-        return;
-    }
+static void dg_free_pkv_store(const llama_model_diffusion_gemma & m) {
     if (m.pkv_buf) { ggml_backend_buffer_free(m.pkv_buf); m.pkv_buf = nullptr; }
     if (m.pkv_ctx) { ggml_free(m.pkv_ctx); m.pkv_ctx = nullptr; }
     m.pkv_k.clear();
     m.pkv_v.clear();
+    m.pkv_cap = 0;
+}
+
+// Returns false, with no store left, when the buffer does not fit on layer-0's device.
+static bool dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P, ggml_type type) {
+    if (m.pkv_buf != nullptr && m.pkv_cap >= P && !m.pkv_k.empty() && m.pkv_k[0]->type == type) {
+        return true;
+    }
+    dg_free_pkv_store(m);
 
     const int     n_layer = (int) m.hparams.n_layer();
     const int64_t cap     = P;
@@ -809,8 +816,37 @@ static void dg_ensure_pkv_store(const llama_model_diffusion_gemma & m, int64_t P
     ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_buffer_type(dev)
                                           : ggml_backend_cpu_buffer_type();
     m.pkv_buf = ggml_backend_alloc_ctx_tensors_from_buft(m.pkv_ctx, buft);
-    GGML_ASSERT(m.pkv_buf != nullptr);
+    if (m.pkv_buf == nullptr) {
+        dg_free_pkv_store(m);
+        return false;
+    }
     m.pkv_cap = cap;
+    return true;
+}
+
+// Public API: allocate the prompt-KV store for a prompt of P tokens now, so that a later PREFILL up to P
+// reuses it instead of allocating mid-turn. P <= 0 frees the store. False when it does not fit.
+bool llama_diffusion_reserve_pkv(struct llama_model * model, int32_t P, bool use_f16) {
+    auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model);
+    if (!dm) {
+        return false;
+    }
+    if (P <= 0) {
+        dg_free_pkv_store(*dm);
+        return true;
+    }
+    return dg_ensure_pkv_store(*dm, P, use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32);
+}
+
+// Public API: allocate the device self-conditioning buffers for a canvas of C tokens now instead of on the
+// first step, so the memory left for the context is measured with them in place.
+void llama_diffusion_reserve_sc(struct llama_model * model, int32_t C) {
+    auto * dm = dynamic_cast<llama_model_diffusion_gemma *>(model);
+    if (!dm || C <= 0) {
+        return;
+    }
+    dg_ensure_sc_embT(*dm);
+    dg_ensure_sc_dev(*dm, C);
 }
 
 // Public API: bytes the prompt-KV store consumes per prompt token (sum over layers of K+V element counts x

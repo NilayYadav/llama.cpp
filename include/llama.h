@@ -646,6 +646,18 @@ extern "C" {
             const struct llama_model * model,
                               bool      use_f16);
 
+    // Allocate the DiffusionGemma prompt-KV store for a prompt of P tokens now, so that a later PREFILL up
+    // to P reuses it instead of allocating mid-turn. P <= 0 frees the store. False when it does not fit.
+    LLAMA_API bool llama_diffusion_reserve_pkv(
+            struct llama_model * model,
+                       int32_t   P,
+                          bool   use_f16);
+
+    // Allocate the device self-conditioning buffers for a canvas of C tokens now instead of on the first step.
+    LLAMA_API void llama_diffusion_reserve_sc(
+            struct llama_model * model,
+                       int32_t   C);
+
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);

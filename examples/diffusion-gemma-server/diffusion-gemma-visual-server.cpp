@@ -190,6 +190,11 @@ int main(int argc, char ** argv) {
                                      one_gpu ? 65536 : split_ceil);
     const int cands[] = {65536, 49152, 40960, 32768, 24576, 20480, 16384, 12288, 8192, 6144, 4096, 2048};
 
+    // The first turn would otherwise allocate the self-conditioning buffers and the prompt-KV store after the
+    // context was sized without them, and a long prompt then died in cudaMalloc. Size against them instead.
+    if (one_gpu) llama_diffusion_reserve_sc(model, (int32_t) canvas_length);
+    const size_t pkv_per_tok = one_gpu ? llama_diffusion_pkv_bytes_per_token(model, fa_on) : 0;
+
     // VRAM budget (where NGL asks the model to live) and RAM budget (where it spills if it overflows VRAM).
     size_t v_free = 0, v_total = 0;
     if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &v_free, &v_total);
@@ -207,6 +212,18 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "DG_FREE_RAM_MB=%s active\n", e);
     }
 
+    const size_t vram_headroom = v_total ? (size_t) (v_total * 0.08) : (size_t) 1536 * 1024 * 1024;
+    // Allocates the store for a context of N full of prompt. A store that took VRAM must leave the per-step pool.
+    auto reserve_store = [&](int N) {
+        if (!one_gpu) return true;
+        size_t f0 = 0, f1 = 0, t = 0;
+        if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &f0, &t);
+        if (!llama_diffusion_reserve_pkv(model, N - (int32_t) canvas_length, fa_on)) return false;
+        if (gpu_dev) ggml_backend_dev_memory(gpu_dev, &f1, &t);
+        if (f1 < f0 && f1 < vram_headroom) { llama_diffusion_reserve_pkv(model, 0, fa_on); return false; }
+        return true;
+    };
+
     // Probe descending candidates within `budget` bytes; return the largest that allocates. gpu_headroom>0
     // also requires that much VRAM free after creation (the per-step pool); 0 skips that GPU-only check.
     auto probe = [&](int ceil_ctx, size_t budget, size_t gpu_headroom, int * out_n) -> llama_context * {
@@ -216,10 +233,12 @@ int main(int argc, char ** argv) {
             if (N < floor_ctx) break;
             if (budget) {   // an fp32 [n_head, N, N] scores buffer is unavoidable (FA off): skip if it can't fit
                 const double min_scores = (double) n_head * (double) N * (double) N * 4.0;
-                if (min_scores > (double) budget * 0.9) continue;
+                const double store      = (double) pkv_per_tok * (double) (N - canvas_length);
+                if (min_scores + store > (double) budget * 0.9) continue;
             }
             llama_context * c = llama_init_from_model(model, make_cparams(N));
             if (!c) continue;
+            if (!reserve_store(N)) { llama_free(c); continue; }
             if (gpu_headroom && gpu_dev) {
                 size_t f = 0, t = 0; ggml_backend_dev_memory(gpu_dev, &f, &t);
                 if (f < gpu_headroom) { llama_free(c); continue; }
@@ -235,16 +254,17 @@ int main(int argc, char ** argv) {
     const char * reason = "auto";
 
     if (MAXTOK_ENV > 0 && (one_gpu || MAXTOK_ENV <= split_ceil)) {   // explicit budget: honour exactly if it fits, else degrade through the probe
-        const double sc = (double) n_head * (double) MAXTOK_ENV * (double) MAXTOK_ENV * 4.0;
+        const double sc = (double) n_head * (double) MAXTOK_ENV * (double) MAXTOK_ENV * 4.0
+                        + (double) pkv_per_tok * (double) std::max<int64_t>(0, MAXTOK_ENV - canvas_length);
         const size_t budget = std::max(v_free, ram_budget);
         if (!budget || sc <= (double) budget * 0.9) {
             ctx = llama_init_from_model(model, make_cparams(MAXTOK_ENV));
+            if (ctx && !reserve_store(MAXTOK_ENV)) { llama_free(ctx); ctx = nullptr; }
             if (ctx) { MAXTOK = MAXTOK_ENV; reason = "requested"; }
         }
     }
     if (!ctx) {
         const int ceil_ctx = MAXTOK_ENV > 0 ? std::min(auto_ceil, MAXTOK_ENV) : auto_ceil;
-        const size_t vram_headroom = v_total ? (size_t) (v_total * 0.08) : (size_t) 1536 * 1024 * 1024;
         int n1 = 0;
         ctx = probe(ceil_ctx, v_free, vram_headroom, &n1);       // pass 1: VRAM-gated (unchanged on ample VRAM)
         if (ctx) { MAXTOK = n1; reason = "vram"; }
@@ -259,6 +279,11 @@ int main(int argc, char ** argv) {
         int N = std::max((int) canvas_length, (int) ((floor_ctx / canvas_length) * canvas_length));
         ctx = llama_init_from_model(model, make_cparams(N));
         if (ctx) { MAXTOK = N; reason = "floor"; }
+    }
+    // A rejected larger candidate frees the store, so the chosen context gets its own back here.
+    if (ctx && one_gpu && !llama_diffusion_reserve_pkv(model, MAXTOK - (int32_t) canvas_length, fa_on)) {
+        llama_free(ctx);
+        ctx = nullptr;
     }
     if (!ctx) {
         fprintf(stderr, "failed to size a context that fits (VRAM free=%zu MiB, RAM budget=%zu MiB): model too "
